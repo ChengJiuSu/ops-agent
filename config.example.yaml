@@ -1,0 +1,27 @@
+# ops-agent 配置模板：复制为 /etc/ops-agent/config.yaml 并按环境修改。
+
+# ── 连接 ─────────────────────────────────────────────────
+manager_url: wss://ops.example.com/ws/agent/   # manager WebSocket 地址
+token: "<在 manager「Agent 管理」创建 agent 时获得，仅展示一次>"
+agent_name: nat-gw-01                          # 与 manager 侧登记名一致（标识用）
+heartbeat_interval: 30                         # 心跳间隔（秒）
+reconnect_max_delay: 60                        # 断线重连退避封顶（秒）
+# tls_ca_file: /etc/ops-agent/ca.pem           # 自签证书时指定 CA
+
+# ── 执行 ─────────────────────────────────────────────────
+max_concurrent_jobs: 2        # 并发执行上限，超出排队
+max_queued_jobs: 10           # 排队上限，再满拒收（manager 侧按模块失败处理）
+max_forks: 10                 # ansible 并发主机数封顶（与下发值取小）
+job_timeout_max: 3600         # 单任务超时封顶（秒）
+ansible_project_dir: /opt/ansible-project   # 与 manager 同源的 git 剧本仓库
+project_sync_cmd: "git pull --ff-only"      # 剧本任务执行前同步命令（留空跳过）
+project_sync_timeout: 120
+
+# ── 留存与资源 ───────────────────────────────────────────
+data_dir: /var/lib/ops-agent   # spool/（回传缓存）与 artifacts/（执行留存）
+log_dir: /var/log/ops-agent    # agent 自身日志（50MB × 5 轮转）
+log_retention_days: 30         # artifacts 留存天数
+disk_min_free_pct: 15          # 磁盘空闲低于该百分比：拒收新任务 + 加速清理
+max_job_log_lines: 100000      # 单任务回传行数上限（本地 stdout.log 仍全量）
+log_chunk_lines: 50            # 日志分片行数
+log_flush_interval: 1.0        # 分片冲刷间隔（秒）

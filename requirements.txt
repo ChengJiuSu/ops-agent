@@ -1,0 +1,7 @@
+# WebSocket 客户端（asyncio）
+websockets>=12.0
+# 配置文件解析
+PyYAML>=6.0
+
+# 运行前置（不在此安装）：ansible-core —— agent 主机需自行安装并保证
+# ansible / ansible-playbook 在 PATH 上（建议与本 venv 同装：pip install ansible-core）

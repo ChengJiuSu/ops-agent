@@ -1,0 +1,28 @@
+# ops-agent systemd 单元
+# 安装：
+#   sudo cp deploy/ops-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ops-agent
+# 资源硬限制在此声明（不依赖代码自觉），按出口主机规格调整。
+[Unit]
+Description=ops-agent (NAT egress execution agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ops-agent
+Group=ops-agent
+ExecStart=/opt/ops-agent/venv/bin/python -m ops_agent.main -c /etc/ops-agent/config.yaml
+WorkingDirectory=/opt/ops-agent
+Restart=always
+RestartSec=5
+# 停机给 ansible 进程组留终止时间（agent 收 SIGTERM 后先终止任务再退出）
+TimeoutStopSec=30
+
+# ── 资源硬限制 ──
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=256
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
