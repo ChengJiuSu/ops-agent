@@ -9,7 +9,8 @@ reconnect_max_delay: 60                        # 断线重连退避封顶（秒�
 # tls_ca_file: /etc/ops-agent/ca.pem           # 自签证书时指定 CA
 
 # ── 执行 ─────────────────────────────────────────────────
-max_concurrent_jobs: 2        # 并发执行上限，超出排队
+max_concurrent_jobs: 2        # ansible 并发执行上限，超出排队
+max_concurrent_jenkins_jobs: 4  # Jenkins 构建并发（纯 IO 等待，与 ansible 各占一批槽）
 max_queued_jobs: 10           # 排队上限，再满拒收（manager 侧按模块失败处理）
 max_forks: 10                 # ansible 并发主机数封顶（与下发值取小）
 job_timeout_max: 3600         # 单任务超时封顶（秒）
@@ -25,3 +26,15 @@ disk_min_free_pct: 15          # 磁盘空闲低于该百分比：拒收新任�
 max_job_log_lines: 100000      # 单任务回传行数上限（本地 stdout.log 仍全量）
 log_chunk_lines: 50            # 日志分片行数
 log_flush_interval: 1.0        # 分片冲刷间隔（秒）
+
+# ── Jenkins（manager 在公网、Jenkins 在内网时经本 agent 触发）─────────
+# 未配置也能正常启动，只是收到 jenkins 执行单元会以 rc=126 失败并回传提示。
+# 凭据只在本机维护，不经通道下发（与 SSH 私钥同口径）。
+# jenkins:
+#   url: http://jenkins.intra:8080
+#   user: ci-bot
+#   api_token: "<Jenkins 用户 API Token>"
+#   verify_tls: true          # 自签且不便配 CA 时置 false
+#   ca_file: ""               # 自签证书 CA 路径（verify_tls: true 时生效）
+#   poll_interval: 2.0        # 队列/日志/结果轮询间隔（秒）
+#   abort_on_cancel: true     # manager 取消或等待超时时中止 Jenkins 上的构建

@@ -3,5 +3,8 @@ websockets>=12.0
 # 配置文件解析
 PyYAML>=6.0
 
+# Jenkins 触发（step_type='jenkins'）用标准库 urllib，无需额外依赖：
+# 阻塞调用经 asyncio.to_thread 出让事件循环（见 ops_agent/jenkins.py）。
+
 # 运行前置（不在此安装）：ansible-core —— agent 主机需自行安装并保证
 # ansible / ansible-playbook 在 PATH 上（建议与本 venv 同装：pip install ansible-core）

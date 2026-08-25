@@ -4,6 +4,10 @@
 - stdout/stderr 合流逐行读取，tee 到 artifacts/<job_id>/stdout.log 与回调；
 - 剧本路径限制在 ansible_project_dir 内（路径穿越防护）；
 - forks / timeout 均与配置封顶取小。
+
+make_execution 为按 step_type 选实现的工厂：command/playbook 走本模块的
+JobExecution（ansible 子进程），jenkins 走 jenkins.JenkinsExecution（REST
+轮询）。两者接口一致（kind / run(on_lines) / cancel()）。
 """
 import asyncio
 import logging
@@ -16,6 +20,11 @@ from pathlib import Path
 logger = logging.getLogger('ops_agent.executor')
 
 TERM_GRACE = 5  # SIGTERM 后等待秒数，仍存活则 SIGKILL
+
+# step_type → 并发槽位归属（ansible 子进程 / Jenkins REST 轮询各占一批槽）
+STEP_KINDS = {'command': 'ansible', 'playbook': 'ansible', 'jenkins': 'jenkins'}
+# register 上报的能力清单：manager 据此对老 agent fail fast
+CAPABILITIES = sorted(STEP_KINDS)
 
 
 class PayloadError(Exception):
@@ -83,6 +92,8 @@ def build_argv(payload: dict, inventory_path: str, config) -> tuple:
 
 class JobExecution:
     """一次任务单元的执行句柄：run() 产出日志行，cancel() 终止进程组。"""
+
+    kind = 'ansible'  # 并发槽位归属（见 connection._reject_reason）
 
     def __init__(self, job_id: str, payload: dict, config):
         self.job_id = job_id
@@ -211,3 +222,20 @@ class JobExecution:
         (self.artifacts / 'rc').write_text(str(rc), encoding='utf-8')
         logger.info('job %s 结束：rc=%s elapsed=%ss', self.job_id, rc, elapsed)
         return rc, elapsed
+
+
+def job_kind(payload: dict):
+    """payload 的槽位归属；None = 本 agent 不支持该 step_type。"""
+    return STEP_KINDS.get(payload.get('step_type'))
+
+
+def make_execution(job_id: str, payload: dict, config):
+    """按 step_type 选执行实现，未知类型抛 PayloadError（下发方拒收）。"""
+    step_type = payload.get('step_type')
+    if step_type in ('command', 'playbook'):
+        return JobExecution(job_id, payload, config)
+    if step_type == 'jenkins':
+        from .jenkins import JenkinsExecution  # 延迟导入：未用 jenkins 时不依赖 aiohttp
+
+        return JenkinsExecution(job_id, payload, config)
+    raise PayloadError(f'不支持的 step_type：{step_type}')

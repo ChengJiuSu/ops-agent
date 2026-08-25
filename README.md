@@ -1,7 +1,8 @@
 # ops-agent
 
 NAT 出口执行代理：与 ops-manager 经 WebSocket 长连接通信，接收命令/剧本
-执行单元，本地调用 ansible 对内网主机执行，流式回传日志。
+执行单元，本地调用 ansible 对内网主机执行，流式回传日志；亦可代 manager
+触发内网 Jenkins 构建（manager 在公网、Jenkins 在内网的场景）。
 
 设计文档：manager 仓库 `docs/ops-agent-design.md`（架构、消息协议、状态机）。
 manager 侧模块：`apps/agent_mgr`（`docs/backend/modules/agent.md`）。
@@ -9,6 +10,9 @@ manager 侧模块：`apps/agent_mgr`（`docs/backend/modules/agent.md`）。
 ## 特性
 
 - **只出不进**：agent 主动外连 manager，不监听任何端口；断线指数退避重连。
+- **三类执行单元**：`command` / `playbook`（ansible 子进程）+ `jenkins`
+  （REST 触发内网 job，控制台日志实时回传）。ansible 与 Jenkins 各占一批
+  并发槽位——后者是纯 IO 等待，不该抢 ansible 的额度。
 - **日志不丢**：分片先落本地 spool，manager ack 后清理；断线/重启后按
   ack 游标补传；终态结果同样 ack 确认。
 - **双层留存**：agent 自身日志（`log_dir`，50MB × 5 轮转）+ 每任务
@@ -50,6 +54,25 @@ journalctl -u ops-agent -f   # 观察连接与心跳
 manager 侧：给 NAT 内主机在「服务器管理」把执行通道切到该 agent，任务流
 执行时命令/剧本模块自动经 agent 下发。
 
+### Jenkins 代触发（可选）
+
+manager 在公网而 Jenkins 在内网时，在 `config.yaml` 加 `jenkins:` 段：
+
+```yaml
+jenkins:
+  url: http://jenkins.intra:8080
+  user: ci-bot
+  api_token: "<Jenkins 用户 API Token>"
+  abort_on_cancel: true   # manager 取消/等待超时时，连带中止 Jenkins 上的构建
+```
+
+凭据只驻留本机、不经通道下发（与 SSH 私钥同口径）；manager 侧只需在
+「系统配置」把 `jenkins.agent` 指向本 agent 名（或在方法/模块参数里指定），
+jenkins 方法模块即改走本 agent，构建日志实时回传任务日志。未配置该段时
+收到 jenkins 单元会以 rc=126 失败并回传提示。
+
+环境里的 `http_proxy/https_proxy` 一律忽略：内网 Jenkins 走代理只会拿 502。
+
 ## 目录
 
 ```
@@ -57,7 +80,8 @@ ops_agent/
 ├── main.py        # 入口：配置加载、日志初始化、信号处理
 ├── config.py      # config.yaml 解析与校验
 ├── connection.py  # AgentApp：连接/重连、心跳、消息路由、任务调度、留存清理
-├── executor.py    # ansible 子进程：流式输出、进程组超时强杀、路径防穿越
+├── executor.py    # ansible 子进程：流式输出、进程组超时强杀、路径防穿越；按 step_type 选实现
+├── jenkins.py     # Jenkins 构建：触发/队列/控制台增量/结果，取消时中止构建
 └── spool.py       # 可靠回传缓存：分片 + ack 游标 + 崩溃恢复
 
 /var/lib/ops-agent/
@@ -75,8 +99,8 @@ ops_agent/
 
 | rc | 含义 |
 |----|------|
-| 0/非零 | ansible 原生返回码 |
-| 124 | 任务超时（agent 强杀） |
-| 126 | payload/环境错误（剧本不存在、同步失败等） |
-| 137 | agent 重启导致任务中断 |
+| 0/非零 | ansible 原生返回码；jenkins 单元 0=SUCCESS（或 UNSTABLE 且 allow_unstable），1=其余构建结果/请求失败 |
+| 124 | 任务超时（ansible 进程组强杀；jenkins 等待构建超时） |
+| 126 | payload/环境错误（剧本不存在、同步失败、未配 Jenkins 连接信息、agent 不支持的 step_type 等） |
+| 137 | agent 重启导致任务中断（jenkins 单元：Jenkins 上的构建不随 agent 消亡，仍会跑完） |
 | 143 | manager 取消 |

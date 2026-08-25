@@ -2,7 +2,7 @@
 
 - 主动外连 manager（wss），指数退避重连（1s→2s→…封顶，±20% 抖动）；
 - 断线不中断执行中任务：日志分片先落 spool，重连后按 ack 游标补传；
-- 并发/排队/磁盘水位超限即 task.ack 拒收；
+- 并发/排队/磁盘水位超限即 task.ack 拒收（ansible 与 jenkins 各一批槽位）；
 - 崩溃恢复：启动扫描 spool，无终态的任务标记 rc=137 中断上报。
 """
 import asyncio
@@ -16,13 +16,16 @@ import time
 import websockets
 
 from . import __version__
-from .executor import JobExecution
+from .executor import CAPABILITIES, PayloadError, job_kind, make_execution
 from .spool import JobSpool, pending_jobs
 
 logger = logging.getLogger('ops_agent')
 
 CLEANUP_INTERVAL = 3600  # 留存清理周期（秒）
 RC_INTERRUPTED = 137     # agent 崩溃/重启导致任务中断
+RC_PAYLOAD_ERROR = 126   # payload/环境错误
+# 槽位中文名：拒收原因文案用
+KIND_LABELS = {'ansible': 'ansible', 'jenkins': 'Jenkins'}
 
 
 class LogPump:
@@ -70,9 +73,14 @@ class AgentApp:
         self._seq = 0
         self._stopping = False
         self._send_lock = asyncio.Lock()
-        self._slots = asyncio.Semaphore(config.max_concurrent_jobs)
-        self._queued = 0
-        self.executions = {}   # job_id -> JobExecution（运行中）
+        # 按槽位归属分池：jenkins 是纯 IO 等待，不与 ansible 抢并发额度
+        self._slots = {
+            'ansible': asyncio.Semaphore(config.max_concurrent_jobs),
+            'jenkins': asyncio.Semaphore(config.max_concurrent_jenkins_jobs),
+        }
+        self._running = {'ansible': 0, 'jenkins': 0}
+        self._queued = {'ansible': 0, 'jenkins': 0}
+        self.executions = {}   # job_id -> 执行句柄（运行中）
         self.spools = {}       # job_id -> JobSpool（运行中 + 待补传孤儿）
         self._job_tasks = set()
 
@@ -92,6 +100,7 @@ class AgentApp:
                         'agent_name': self.config.agent_name,
                         'version': __version__,
                         'hostname': os.uname().nodename,
+                        'capabilities': CAPABILITIES,
                     })
                     await self._resend_pending()
                     heartbeat = asyncio.ensure_future(self._heartbeat_loop())
@@ -200,7 +209,10 @@ class AgentApp:
             # 幂等：重复下发直接受理确认，不重复执行
             await self.send('task.ack', {'job_id': job_id, 'accepted': True})
             return
-        reason = self._reject_reason()
+        kind = job_kind(payload)
+        reason = (f'agent 不支持的执行类型 step_type={payload.get("step_type")}'
+                  f'（agent 版本过低？本 agent 支持：{", ".join(CAPABILITIES)}）'
+                  if kind is None else self._reject_reason(kind))
         if reason:
             logger.warning('拒收 job %s：%s', job_id, reason)
             await self.send('task.ack', {'job_id': job_id, 'accepted': False, 'reason': reason})
@@ -209,34 +221,45 @@ class AgentApp:
         spool = JobSpool(self.config.spool_dir, job_id)
         spool.save_payload(payload)
         self.spools[job_id] = spool
-        task = asyncio.ensure_future(self._run_job(job_id, payload, spool))
+        task = asyncio.ensure_future(self._run_job(job_id, payload, spool, kind))
         self._job_tasks.add(task)
         task.add_done_callback(self._job_tasks.discard)
 
-    async def _run_job(self, job_id, payload, spool):
-        self._queued += 1
+    async def _run_job(self, job_id, payload, spool, kind):
+        self._queued[kind] += 1
         try:
-            async with self._slots:
-                self._queued -= 1
+            async with self._slots[kind]:
+                self._queued[kind] -= 1
+                self._running[kind] += 1
                 pump = LogPump(self, spool, self.config.log_flush_interval,
                                self.config.log_chunk_lines)
-                execution = JobExecution(job_id, payload, self.config)
-                self.executions[job_id] = execution
                 try:
-                    rc, elapsed = await execution.run(pump.on_lines)
-                except Exception as exc:
-                    logger.exception('job %s 执行异常', job_id)
-                    await pump.on_lines([f'✖ agent 内部错误：{exc}'])
-                    rc, elapsed = 126, 0
+                    rc, elapsed = await self._execute(job_id, payload, pump)
                 finally:
+                    self._running[kind] -= 1
                     self.executions.pop(job_id, None)
                     await pump.close()
                 result = {'rc': rc, 'elapsed': elapsed, 'host_results': {}}
                 spool.save_result(result)
                 await self.send('task.result', {'job_id': job_id, **result})
         except Exception:
-            self._queued = max(0, self._queued - 1)
+            self._queued[kind] = max(0, self._queued[kind] - 1)
             logger.exception('job %s 调度异常', job_id)
+
+    async def _execute(self, job_id, payload, pump):
+        """建执行句柄并跑完，返回 (rc, elapsed)；异常统一转 rc=126。"""
+        try:
+            execution = make_execution(job_id, payload, self.config)
+        except PayloadError as exc:
+            await pump.on_lines([f'✖ {exc}'])
+            return RC_PAYLOAD_ERROR, 0
+        self.executions[job_id] = execution
+        try:
+            return await execution.run(pump.on_lines)
+        except Exception as exc:  # noqa: BLE001 - 任何执行异常都要有终态回传
+            logger.exception('job %s 执行异常', job_id)
+            await pump.on_lines([f'✖ agent 内部错误：{exc}'])
+            return RC_PAYLOAD_ERROR, 0
 
     async def _on_cancel(self, data):
         job_id = str(data.get('job_id') or '')
@@ -258,11 +281,13 @@ class AgentApp:
             spool.cleanup()
             logger.info('job %s 已确认并清理 spool（artifacts 留存至过期）', job_id)
 
-    def _reject_reason(self):
-        running = len(self.executions)
-        if running + self._queued >= self.config.max_concurrent_jobs + self.config.max_queued_jobs:
-            return (f'并发与排队均已满（运行 {running}，'
-                    f'排队 {self._queued}），请稍后重试。')
+    def _reject_reason(self, kind):
+        concurrency = (self.config.max_concurrent_jobs if kind == 'ansible'
+                       else self.config.max_concurrent_jenkins_jobs)
+        running, queued = self._running[kind], self._queued[kind]
+        if running + queued >= concurrency + self.config.max_queued_jobs:
+            return (f'{KIND_LABELS[kind]} 通道并发与排队均已满（运行 {running}，'
+                    f'排队 {queued}），请稍后重试。')
         free_pct = self._disk_free_pct()
         if free_pct < self.config.disk_min_free_pct:
             return f'agent 磁盘空闲不足（{free_pct}% < {self.config.disk_min_free_pct}%），拒收新任务。'
