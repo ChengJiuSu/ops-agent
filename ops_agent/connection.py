@@ -16,7 +16,7 @@ import time
 import websockets
 
 from . import __version__
-from .executor import CAPABILITIES, PayloadError, job_kind, make_execution
+from .executor import CAPABILITIES, PayloadError, job_kind, make_execution, redact_payload
 from .spool import JobSpool, pending_jobs
 
 logger = logging.getLogger('ops_agent')
@@ -219,7 +219,8 @@ class AgentApp:
             return
         await self.send('task.ack', {'job_id': job_id, 'accepted': True})
         spool = JobSpool(self.config.spool_dir, job_id)
-        spool.save_payload(payload)
+        # 敏感字段（证书内容）不落 spool：恢复流程只标中断、不重放执行
+        spool.save_payload(redact_payload(payload))
         self.spools[job_id] = spool
         task = asyncio.ensure_future(self._run_job(job_id, payload, spool, kind))
         self._job_tasks.add(task)

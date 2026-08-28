@@ -10,9 +10,9 @@ manager 侧模块：`apps/agent_mgr`（`docs/backend/modules/agent.md`）。
 ## 特性
 
 - **只出不进**：agent 主动外连 manager，不监听任何端口；断线指数退避重连。
-- **三类执行单元**：`command` / `playbook`（ansible 子进程）+ `jenkins`
-  （REST 触发内网 job，控制台日志实时回传）。ansible 与 Jenkins 各占一批
-  并发槽位——后者是纯 IO 等待，不该抢 ansible 的额度。
+- **四类执行单元**：`command` / `playbook` / `cert_deploy`（ansible 子进程）
+  + `jenkins`（REST 触发内网 job，控制台日志实时回传）。ansible 与 Jenkins
+  各占一批并发槽位——后者是纯 IO 等待，不该抢 ansible 的额度。
 - **日志不丢**：分片先落本地 spool，manager ack 后清理；断线/重启后按
   ack 游标补传；终态结果同样 ack 确认。
 - **双层留存**：agent 自身日志（`log_dir`，50MB × 5 轮转）+ 每任务
@@ -73,6 +73,19 @@ jenkins 方法模块即改走本 agent，构建日志实时回传任务日志。
 
 环境里的 `http_proxy/https_proxy` 一律忽略：内网 Jenkins 走代理只会拿 502。
 
+### 证书分发（`cert_deploy`，无需配置）
+
+manager 的云控证书分发到 agent 通道主机时下发 `cert_deploy` 单元：payload 带
+目标目录、重载命令与文件清单（`name` / `mode` / `content`），**剧本由 agent
+本地生成**（建目录 0750 → copy 各文件、覆盖前 backup → 可选 reload），不接受
+下发的剧本内容。
+
+证书明文的落盘面：只写 `tempfile.mkdtemp()`（0700）内的 0600 文件，inventory
+与生成的剧本一并放在那里，**不进 artifacts**（有留存期），执行结束（含异常/
+超时/取消）连目录一起删；spool 的 `payload.json` 里 `files` 已换成占位串
+（崩溃恢复只标 rc=137 上报，不重放执行）。校验不过（目标目录非绝对路径、
+文件名带路径、mode 非法、单文件 > 256 KiB 或合计 > 1 MiB）→ rc=126。
+
 ## 目录
 
 ```
@@ -80,7 +93,7 @@ ops_agent/
 ├── main.py        # 入口：配置加载、日志初始化、信号处理
 ├── config.py      # config.yaml 解析与校验
 ├── connection.py  # AgentApp：连接/重连、心跳、消息路由、任务调度、留存清理
-├── executor.py    # ansible 子进程：流式输出、进程组超时强杀、路径防穿越；按 step_type 选实现
+├── executor.py    # ansible 子进程：流式输出、进程组超时强杀、路径防穿越；按 step_type 选实现；cert_deploy 剧本本地生成 + 私有临时目录
 ├── jenkins.py     # Jenkins 构建：触发/队列/控制台增量/结果，取消时中止构建
 └── spool.py       # 可靠回传缓存：分片 + ack 游标 + 崩溃恢复
 
@@ -101,6 +114,6 @@ ops_agent/
 |----|------|
 | 0/非零 | ansible 原生返回码；jenkins 单元 0=SUCCESS（或 UNSTABLE 且 allow_unstable），1=其余构建结果/请求失败 |
 | 124 | 任务超时（ansible 进程组强杀；jenkins 等待构建超时） |
-| 126 | payload/环境错误（剧本不存在、同步失败、未配 Jenkins 连接信息、agent 不支持的 step_type 等） |
+| 126 | payload/环境错误（剧本不存在、同步失败、未配 Jenkins 连接信息、cert_deploy 文件清单非法、agent 不支持的 step_type 等） |
 | 137 | agent 重启导致任务中断（jenkins 单元：Jenkins 上的构建不随 agent 消亡，仍会跑完） |
 | 143 | manager 取消 |
