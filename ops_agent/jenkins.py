@@ -12,20 +12,18 @@ Jenkins 连接信息只在 agent 本地 config.yaml 的 `jenkins:` 段维护（�
 与 executor.JobExecution 同接口（kind / run / cancel），故复用 connection 的
 LogPump、spool 分片回传、ack 补传、artifacts 留存全套设施。
 
-HTTP 用标准库 urllib（agent 部署只需 websockets + PyYAML，不引入第三方
-HTTP 库），阻塞调用一律经 asyncio.to_thread 出让事件循环，避免卡住心跳。
+HTTP 走 httpclient.HttpClient（标准库 urllib 封装，与 JumpServer 注册共用），
+阻塞调用一律经 asyncio.to_thread 出让事件循环，避免卡住心跳。
 """
 import asyncio
 import base64
-import json
 import logging
 import re
-import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+from .httpclient import HttpClient, HttpError
 
 logger = logging.getLogger('ops_agent.jenkins')
 
@@ -50,74 +48,24 @@ class JenkinsError(Exception):
         self.message = message
 
 
-class Response:
-    """极简响应对象：HTTP 错误码也当响应返回（403 要取 crumb 重试）。"""
-
-    __slots__ = ('status', 'headers', 'text')
-
-    def __init__(self, status, headers, text):
-        self.status = status
-        self.headers = headers
-        self.text = text
-
-    def json(self):
-        try:
-            data = json.loads(self.text)
-        except (ValueError, TypeError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """触发构建要读 201 的 Location 头，不能被自动重定向吃掉。"""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 class JenkinsClient:
-    """同步 HTTP 客户端（供 asyncio.to_thread 调用）。"""
+    """Jenkins REST 客户端：共用 HttpClient，连接层失败转 JenkinsError。"""
 
     def __init__(self, config):
-        self.config = config
         token = f'{config.user}:{config.api_token}'.encode('utf-8')
-        self._headers = {
-            'Authorization': 'Basic ' + base64.b64encode(token).decode('ascii'),
-        }
-        # ProxyHandler({})：忽略环境里的 http_proxy/https_proxy —— Jenkins 在内网，
-        # 走代理只会拿到 502（manager 侧 JumpServer 对接踩过同一个坑）。
-        self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            _NoRedirect(),
-            urllib.request.HTTPSHandler(context=self._ssl_context()),
-        )
-
-    def _ssl_context(self):
-        if not self.config.verify_tls:
-            return ssl._create_unverified_context()
-        return ssl.create_default_context(cafile=self.config.ca_file or None)
+        self._client = HttpClient(
+            headers={'Authorization': 'Basic ' + base64.b64encode(token).decode('ascii')},
+            verify_tls=config.verify_tls, ca_file=config.ca_file, timeout=HTTP_TIMEOUT)
 
     def set_header(self, key, value):
-        self._headers[key] = value
+        self._client.set_header(key, value)
 
-    def request(self, method, url, params=None) -> Response:
+    def request(self, method, url, params=None):
         """发一次请求；连接异常抛 JenkinsError(rc=1)，HTTP 错误码正常返回。"""
-        if params:
-            url = f'{url}?{urllib.parse.urlencode(params)}'
-        data = b'' if method == 'POST' else None
-        req = urllib.request.Request(url, data=data, method=method,
-                                     headers=dict(self._headers))
         try:
-            with self._opener.open(req, timeout=HTTP_TIMEOUT) as resp:
-                body = resp.read().decode('utf-8', 'replace')
-                return Response(resp.status, dict(resp.headers), body)
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode('utf-8', 'replace')
-            return Response(exc.code, dict(exc.headers or {}), body)
-        except urllib.error.URLError as exc:
-            raise JenkinsError(1, f'Jenkins 请求失败（{url}）：{exc.reason}') from exc
-        except (OSError, ValueError) as exc:
-            raise JenkinsError(1, f'Jenkins 请求失败（{url}）：{exc}') from exc
+            return self._client.request(method, url, params)
+        except HttpError as exc:
+            raise JenkinsError(1, f'Jenkins {exc}') from exc
 
 
 class JenkinsExecution:

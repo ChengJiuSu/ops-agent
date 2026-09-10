@@ -2,7 +2,7 @@
 
 - 主动外连 manager（wss），指数退避重连（1s→2s→…封顶，±20% 抖动）；
 - 断线不中断执行中任务：日志分片先落 spool，重连后按 ack 游标补传；
-- 并发/排队/磁盘水位超限即 task.ack 拒收（ansible 与 jenkins 各一批槽位）；
+- 并发/排队/磁盘水位超限即 task.ack 拒收（ansible / jenkins / jumpserver 各一批槽位）；
 - 崩溃恢复：启动扫描 spool，无终态的任务标记 rc=137 中断上报。
 """
 import asyncio
@@ -25,7 +25,7 @@ CLEANUP_INTERVAL = 3600  # 留存清理周期（秒）
 RC_INTERRUPTED = 137     # agent 崩溃/重启导致任务中断
 RC_PAYLOAD_ERROR = 126   # payload/环境错误
 # 槽位中文名：拒收原因文案用
-KIND_LABELS = {'ansible': 'ansible', 'jenkins': 'Jenkins'}
+KIND_LABELS = {'ansible': 'ansible', 'jenkins': 'Jenkins', 'jumpserver': 'JumpServer'}
 
 
 class LogPump:
@@ -73,13 +73,15 @@ class AgentApp:
         self._seq = 0
         self._stopping = False
         self._send_lock = asyncio.Lock()
-        # 按槽位归属分池：jenkins 是纯 IO 等待，不与 ansible 抢并发额度
-        self._slots = {
-            'ansible': asyncio.Semaphore(config.max_concurrent_jobs),
-            'jenkins': asyncio.Semaphore(config.max_concurrent_jenkins_jobs),
+        # 按槽位归属分池：jenkins/jumpserver 是纯 IO 等待，不与 ansible 抢并发额度
+        self._concurrency = {
+            'ansible': config.max_concurrent_jobs,
+            'jenkins': config.max_concurrent_jenkins_jobs,
+            'jumpserver': config.max_concurrent_jumpserver_jobs,
         }
-        self._running = {'ansible': 0, 'jenkins': 0}
-        self._queued = {'ansible': 0, 'jenkins': 0}
+        self._slots = {k: asyncio.Semaphore(v) for k, v in self._concurrency.items()}
+        self._running = dict.fromkeys(self._concurrency, 0)
+        self._queued = dict.fromkeys(self._concurrency, 0)
         self.executions = {}   # job_id -> 执行句柄（运行中）
         self.spools = {}       # job_id -> JobSpool（运行中 + 待补传孤儿）
         self._job_tasks = set()
@@ -235,12 +237,13 @@ class AgentApp:
                 pump = LogPump(self, spool, self.config.log_flush_interval,
                                self.config.log_chunk_lines)
                 try:
-                    rc, elapsed = await self._execute(job_id, payload, pump)
+                    rc, elapsed, host_results = await self._execute(job_id, payload, pump)
                 finally:
                     self._running[kind] -= 1
                     self.executions.pop(job_id, None)
                     await pump.close()
-                result = {'rc': rc, 'elapsed': elapsed, 'host_results': {}}
+                result = {'rc': rc, 'elapsed': elapsed,
+                          'host_results': host_results}
                 spool.save_result(result)
                 await self.send('task.result', {'job_id': job_id, **result})
         except Exception:
@@ -248,19 +251,24 @@ class AgentApp:
             logger.exception('job %s 调度异常', job_id)
 
     async def _execute(self, job_id, payload, pump):
-        """建执行句柄并跑完，返回 (rc, elapsed)；异常统一转 rc=126。"""
+        """建执行句柄并跑完，返回 (rc, elapsed, host_results)；异常统一转 rc=126。
+
+        host_results 为执行句柄可选提供的逐主机结构化结果（JumpServer 注册用，
+        manager 侧据此还原每台的成功/跳过/失败），未提供则为空。
+        """
         try:
             execution = make_execution(job_id, payload, self.config)
         except PayloadError as exc:
             await pump.on_lines([f'✖ {exc}'])
-            return RC_PAYLOAD_ERROR, 0
+            return RC_PAYLOAD_ERROR, 0, {}
         self.executions[job_id] = execution
         try:
-            return await execution.run(pump.on_lines)
+            rc, elapsed = await execution.run(pump.on_lines)
         except Exception as exc:  # noqa: BLE001 - 任何执行异常都要有终态回传
             logger.exception('job %s 执行异常', job_id)
             await pump.on_lines([f'✖ agent 内部错误：{exc}'])
-            return RC_PAYLOAD_ERROR, 0
+            rc, elapsed = RC_PAYLOAD_ERROR, 0
+        return rc, elapsed, getattr(execution, 'host_results', None) or {}
 
     async def _on_cancel(self, data):
         job_id = str(data.get('job_id') or '')
@@ -283,8 +291,7 @@ class AgentApp:
             logger.info('job %s 已确认并清理 spool（artifacts 留存至过期）', job_id)
 
     def _reject_reason(self, kind):
-        concurrency = (self.config.max_concurrent_jobs if kind == 'ansible'
-                       else self.config.max_concurrent_jenkins_jobs)
+        concurrency = self._concurrency[kind]
         running, queued = self._running[kind], self._queued[kind]
         if running + queued >= concurrency + self.config.max_queued_jobs:
             return (f'{KIND_LABELS[kind]} 通道并发与排队均已满（运行 {running}，'

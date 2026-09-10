@@ -2,7 +2,8 @@
 
 NAT 出口执行代理：与 ops-manager 经 WebSocket 长连接通信，接收命令/剧本
 执行单元，本地调用 ansible 对内网主机执行，流式回传日志；亦可代 manager
-触发内网 Jenkins 构建（manager 在公网、Jenkins 在内网的场景）。
+触发内网 Jenkins 构建、把主机注册到内网 JumpServer（manager 在公网、被调
+服务在内网的场景）。
 
 设计文档：manager 仓库 `docs/ops-agent-design.md`（架构、消息协议、状态机）。
 manager 侧模块：`apps/agent_mgr`（`docs/backend/modules/agent.md`）。
@@ -10,9 +11,10 @@ manager 侧模块：`apps/agent_mgr`（`docs/backend/modules/agent.md`）。
 ## 特性
 
 - **只出不进**：agent 主动外连 manager，不监听任何端口；断线指数退避重连。
-- **四类执行单元**：`command` / `playbook` / `cert_deploy`（ansible 子进程）
-  + `jenkins`（REST 触发内网 job，控制台日志实时回传）。ansible 与 Jenkins
-  各占一批并发槽位——后者是纯 IO 等待，不该抢 ansible 的额度。
+- **五类执行单元**：`command` / `playbook` / `cert_deploy`（ansible 子进程）
+  + `jenkins`（REST 触发内网 job，控制台日志实时回传）+ `jumpserver`
+  （逐台注册内网 JumpServer 资产）。ansible / Jenkins / JumpServer 各占一批
+  并发槽位——后两者是纯 IO 等待，不该抢 ansible 的额度。
 - **日志不丢**：分片先落本地 spool，manager ack 后清理；断线/重启后按
   ack 游标补传；终态结果同样 ack 确认。
 - **双层留存**：agent 自身日志（`log_dir`，50MB × 5 轮转）+ 每任务
@@ -73,6 +75,28 @@ jenkins 方法模块即改走本 agent，构建日志实时回传任务日志。
 
 环境里的 `http_proxy/https_proxy` 一律忽略：内网 Jenkins 走代理只会拿 502。
 
+### JumpServer 代注册（可选）
+
+manager 在公网而 JumpServer 在内网时，在 `config.yaml` 加 `jumpserver:` 段：
+
+```yaml
+jumpserver:
+  url: http://jumpserver.intra
+  token: "<JumpServer 个人 API Token>"
+  org_id: ""          # 多组织时指定（X-JMS-ORG 头）
+  platform_id: "1"    # 平台 id（默认 1 = Linux）
+  node_id: ""         # 资产挂载节点 id
+```
+
+凭据同样只驻留本机。manager 侧在「系统配置」把 `jumpserver.agent` 指向本
+agent 名（或让主机执行通道命中本 agent），资产页「注册 JumpServer」与
+jumpserver 方法模块即改走本 agent；payload 只带主机清单（名称/地址/SSH
+端口/备注），逐台结果结构化回传，manager 侧展示不变。未配置该段时收到
+jumpserver 单元会以 rc=126 失败并回传提示。
+
+判定口径与 manager 直连一致：按主机名查重、已存在跳过、创建重名硬拒绝并
+中止整批（不自动改名）。单次下发上限 500 台。
+
 ### 证书分发（`cert_deploy`，无需配置）
 
 manager 的云控证书分发到 agent 通道主机时下发 `cert_deploy` 单元：payload 带
@@ -94,7 +118,9 @@ ops_agent/
 ├── config.py      # config.yaml 解析与校验
 ├── connection.py  # AgentApp：连接/重连、心跳、消息路由、任务调度、留存清理
 ├── executor.py    # ansible 子进程：流式输出、进程组超时强杀、路径防穿越；按 step_type 选实现；cert_deploy 剧本本地生成 + 私有临时目录
+├── httpclient.py  # 标准库 urllib 封装：忽略环境代理、不跟随重定向、自签 TLS（jenkins/jumpserver 共用）
 ├── jenkins.py     # Jenkins 构建：触发/队列/控制台增量/结果，取消时中止构建
+├── jumpserver.py  # JumpServer 资产注册：逐台查重/创建，结构化 host_results 回传
 └── spool.py       # 可靠回传缓存：分片 + ack 游标 + 崩溃恢复
 
 /var/lib/ops-agent/
@@ -112,8 +138,8 @@ ops_agent/
 
 | rc | 含义 |
 |----|------|
-| 0/非零 | ansible 原生返回码；jenkins 单元 0=SUCCESS（或 UNSTABLE 且 allow_unstable），1=其余构建结果/请求失败 |
-| 124 | 任务超时（ansible 进程组强杀；jenkins 等待构建超时） |
-| 126 | payload/环境错误（剧本不存在、同步失败、未配 Jenkins 连接信息、cert_deploy 文件清单非法、agent 不支持的 step_type 等） |
+| 0/非零 | ansible 原生返回码；jenkins 单元 0=SUCCESS（或 UNSTABLE 且 allow_unstable），1=其余构建结果/请求失败；jumpserver 单元 0=全部成功（含已存在跳过），1=有主机失败或重名中止 |
+| 124 | 任务超时（ansible 进程组强杀；jenkins 等待构建超时；jumpserver 逐台注册超时） |
+| 126 | payload/环境错误（剧本不存在、同步失败、未配 Jenkins/JumpServer 连接信息、cert_deploy 文件清单非法、jumpserver 主机清单非法或超 500 台、agent 不支持的 step_type 等） |
 | 137 | agent 重启导致任务中断（jenkins 单元：Jenkins 上的构建不随 agent 消亡，仍会跑完） |
 | 143 | manager 取消 |

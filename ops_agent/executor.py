@@ -7,7 +7,8 @@
 
 make_execution 为按 step_type 选实现的工厂：command/playbook/cert_deploy 走
 本模块的 JobExecution（ansible 子进程），jenkins 走 jenkins.JenkinsExecution
-（REST 轮询）。两者接口一致（kind / run(on_lines) / cancel()）。
+（REST 轮询），jumpserver 走 jumpserver.JumpServerExecution（逐台 REST 注册）。
+三者接口一致（kind / run(on_lines) / cancel()）。
 
 cert_deploy（证书分发）：payload 带文件清单与目标目录，剧本由本模块**本地
 生成**（不接受下发的剧本内容，执行面仍只有 copy/file/shell 三个动作）；证书
@@ -30,9 +31,11 @@ logger = logging.getLogger('ops_agent.executor')
 
 TERM_GRACE = 5  # SIGTERM 后等待秒数，仍存活则 SIGKILL
 
-# step_type → 并发槽位归属（ansible 子进程 / Jenkins REST 轮询各占一批槽）
+# step_type → 并发槽位归属：ansible 子进程 / Jenkins REST 轮询 / JumpServer
+# 逐台注册各占一批槽（后两者是纯 IO 等待，不该与 ansible 抢额度）
 STEP_KINDS = {'command': 'ansible', 'playbook': 'ansible',
-              'cert_deploy': 'ansible', 'jenkins': 'jenkins'}
+              'cert_deploy': 'ansible', 'jenkins': 'jenkins',
+              'jumpserver': 'jumpserver'}
 # register 上报的能力清单：manager 据此对老 agent fail fast
 CAPABILITIES = sorted(STEP_KINDS)
 
@@ -368,7 +371,11 @@ def make_execution(job_id: str, payload: dict, config):
     if step_type in ('command', 'playbook', 'cert_deploy'):
         return JobExecution(job_id, payload, config)
     if step_type == 'jenkins':
-        from .jenkins import JenkinsExecution  # 延迟导入：未用 jenkins 时不依赖 aiohttp
+        from .jenkins import JenkinsExecution  # 延迟导入：未用 jenkins 时不加载
 
         return JenkinsExecution(job_id, payload, config)
+    if step_type == 'jumpserver':
+        from .jumpserver import JumpServerExecution
+
+        return JumpServerExecution(job_id, payload, config)
     raise PayloadError(f'不支持的 step_type：{step_type}')
